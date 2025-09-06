@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-import logging
-import sqlite3
+import os
 import re
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
@@ -11,8 +14,8 @@ from telegram.ext import (
 )
 
 # -------- Настройки --------
-TOKEN = "7581280110:AAHnqkCVJGjqBvHD1gU4dl8CsSA0eHOPsRg"  # <-- ВСТАВЬ СВОЙ ТОКЕН
-DB_PATH = "finance.db"
+TOKEN = os.environ["TOKEN"]                 # хранится в Railway Variables
+DATABASE_URL = os.environ["DATABASE_URL"]   # строка подключения к Postgres на Railway
 
 # -------- Состояния --------
 EXPENSE, INCOME = range(2)
@@ -40,47 +43,35 @@ conv_cancel_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True, one_time_keyboard=True
 )
 
-# -------- База данных (инициализация + миграция) --------
+# -------- Подключение к БД --------
+def pg_conn():
+    # Railway требует SSL
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    with pg_conn() as conn, conn.cursor() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                amount INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                timestamp TIMESTAMPTZ NOT NULL
+            );
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS income (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                amount INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                date DATE NOT NULL
+            );
+        """)
+        conn.commit()
 
-    # создаём актуальные таблицы (если их нет)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS income (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            date TEXT NOT NULL
-        )
-    """)
-
-    # --- миграция старой схемы expenses (без user_id/timestamp) ---
-    try:
-        cols = {row[1] for row in c.execute("PRAGMA table_info(expenses)")}
-        if "user_id" not in cols:
-            c.execute("ALTER TABLE expenses ADD COLUMN user_id INTEGER")
-        if "timestamp" not in cols:
-            c.execute("ALTER TABLE expenses ADD COLUMN timestamp TEXT")
-    except Exception as e:
-        log.exception("Migration check failed: %s", e)
-
-    conn.commit()
-    conn.close()
-
-# -------- Вспомогательное --------
+# -------- Утилиты --------
 def _normalize_spaces(s: str) -> str:
-    # заменяем неразрывные/узкие пробелы на обычный
     return (s or "").replace("\u00A0", " ").replace("\u202F", " ").replace("\u2009", " ")
 
 # -------- Хэндлеры --------
@@ -97,24 +88,22 @@ def add_expense(update: Update, context: CallbackContext):
 
 def save_expense(update: Update, context: CallbackContext):
     text = _normalize_spaces(update.message.text).strip()
-    # Разрешаем: "500 лента", "500.00 лента", "500,50 лента"
     m = re.match(r"^\s*(\d+)(?:[.,](\d{1,2}))?\s+(.+?)\s*$", text)
     if not m:
         update.message.reply_text("⚠️ Неверный формат. Пример: 500 пятерочка")
         return EXPENSE
 
-    amount = int(m.group(1))  # копейки игнорируем; при желании можно хранить как целые копейки
+    amount = int(m.group(1))
     category = m.group(3).lower()
+    now = datetime.now(timezone.utc)
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO expenses (user_id, amount, category, timestamp) VALUES (?, ?, ?, ?)",
-            (update.effective_user.id, amount, category, datetime.now().isoformat())
-        )
-        conn.commit()
-        conn.close()
+        with pg_conn() as conn, conn.cursor() as c:
+            c.execute(
+                "INSERT INTO expenses (user_id, amount, category, timestamp) VALUES (%s, %s, %s, %s)",
+                (update.effective_user.id, amount, category, now)
+            )
+            conn.commit()
     except Exception as e:
         log.exception("DB error on save_expense: %s", e)
         update.message.reply_text("💥 Ошибка базы данных. Попробуйте ещё раз.")
@@ -144,17 +133,15 @@ def save_income(update: Update, context: CallbackContext):
 
     amount = int(parts[0])
     category = parts[1].lower()
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = datetime.now(timezone.utc).date()
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO income (user_id, amount, category, date) VALUES (?, ?, ?, ?)",
-            (update.effective_user.id, amount, category, date)
-        )
-        conn.commit()
-        conn.close()
+        with pg_conn() as conn, conn.cursor() as c:
+            c.execute(
+                "INSERT INTO income (user_id, amount, category, date) VALUES (%s, %s, %s, %s)",
+                (update.effective_user.id, amount, category, date)
+            )
+            conn.commit()
     except Exception as e:
         log.exception("DB error on save_income: %s", e)
         update.message.reply_text("💥 Ошибка базы данных. Попробуйте ещё раз.")
@@ -171,20 +158,24 @@ def cancel(update: Update, context: CallbackContext):
     update.message.reply_text("🚫 Действие отменено.", reply_markup=main_keyboard)
     return ConversationHandler.END
 
-# ---- Категории/статистика ----
+# ---- Статистика ----
 def get_stats(period_days: int, user_id: int) -> str:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    since = datetime.now() - timedelta(days=period_days)
-    c.execute(
-        "SELECT category, SUM(amount) FROM expenses WHERE user_id = ? AND timestamp > ? GROUP BY category",
-        (user_id, since.isoformat())
-    )
-    rows = c.fetchall()
-    conn.close()
+    since = datetime.now(timezone.utc) - timedelta(days=period_days)
+    with pg_conn() as conn, conn.cursor() as c:
+        c.execute(
+            """
+            SELECT category, SUM(amount)::INT
+            FROM expenses
+            WHERE user_id = %s AND timestamp > %s
+            GROUP BY category
+            ORDER BY SUM(amount) DESC
+            """,
+            (user_id, since)
+        )
+        rows = c.fetchall()
     if not rows:
         return "Нет трат за выбранный период."
-    return "\n".join([f"{(cat or '').capitalize()}: {amt} ₽" for cat, amt in rows])
+    return "\n".join([f"{(cat or '').capitalize()}: {amt} ₽" for (cat, amt) in rows])
 
 def categories(update: Update, context: CallbackContext):
     kb = ReplyKeyboardMarkup(
@@ -209,14 +200,11 @@ def month_categories(update: Update, context: CallbackContext):
 # ---- Баланс ----
 def balance(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE user_id = ?", (user_id,))
-    total_expenses = c.fetchone()[0] or 0
-    c.execute("SELECT COALESCE(SUM(amount),0) FROM income WHERE user_id = ?", (user_id,))
-    total_income = c.fetchone()[0] or 0
-    conn.close()
-
+    with pg_conn() as conn, conn.cursor() as c:
+        c.execute("SELECT COALESCE(SUM(amount),0)::INT FROM expenses WHERE user_id = %s", (user_id,))
+        total_expenses = c.fetchone()[0] or 0
+        c.execute("SELECT COALESCE(SUM(amount),0)::INT FROM income   WHERE user_id = %s", (user_id,))
+        total_income = c.fetchone()[0] or 0
     net = total_income - total_expenses
     update.message.reply_text(f"💰 Доходы: {total_income} ₽\n💸 Расходы: {total_expenses} ₽\n🧾 Баланс: {net} ₽")
 
@@ -235,7 +223,6 @@ def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Конверсейшн: расходы
     expense_conv = ConversationHandler(
         entry_points=[MessageHandler(Filters.regex(r"(?i)^📤 Add expense$"), add_expense)],
         states={EXPENSE: [MessageHandler(Filters.text & ~Filters.command, save_expense)]},
@@ -246,7 +233,6 @@ def main():
         per_chat=True
     )
 
-    # Конверсейшн: доходы
     income_conv = ConversationHandler(
         entry_points=[MessageHandler(Filters.regex(r"(?i)^📩 Add income$"), add_income)],
         states={INCOME: [MessageHandler(Filters.text & ~Filters.command, save_income)]},
@@ -257,7 +243,6 @@ def main():
         per_chat=True
     )
 
-    # Команды/кнопки
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.regex(r"(?i)^📊 Categories$"), categories))
     dp.add_handler(MessageHandler(Filters.regex(r"(?i)^📅 Today$"), today_categories))
@@ -266,15 +251,9 @@ def main():
     dp.add_handler(MessageHandler(Filters.regex(r"(?i)^💰 Balance$"), balance))
     dp.add_handler(MessageHandler(Filters.regex(r"(?i)^🧠 Analyze$"), analyze))
 
-    # Cancel как глобальная кнопка/команда
-    dp.add_handler(MessageHandler(Filters.regex(r"(?i)^❌ Cancel$"), cancel))
-    dp.add_handler(CommandHandler("cancel", cancel))
-
-    # Конверсейшны
     dp.add_handler(expense_conv)
     dp.add_handler(income_conv)
 
-    # Фолбэк
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
     updater.start_polling()
